@@ -18,8 +18,9 @@ if sys.platform == "win32":
 import numpy as np
 import sounddevice as sd
 from faster_whisper import WhisperModel
-from llm import ask_llm, SYSTEM_PROMPT
+from llm import ask_llm, OLLAMA_MODEL, SYSTEM_PROMPT
 from tts import text_to_speech
+from db import create_session_sync, insert_turn_sync, ping_sync
 import queue
 import sys
 import time
@@ -41,6 +42,9 @@ SILENCE_BLOCKS = int(SILENCE_DURATION_SEC * BLOCKS_PER_SEC)  # ~4 blocks for 2s
 
 # --- TTS config (Kokoro): set False to disable speech and keep text-only ---
 ENABLE_TTS = True
+
+# --- V2 MongoDB: set False to run without DB (no session/turn persistence) ---
+ENABLE_DB = True
 
 audio_queue = queue.Queue()
 
@@ -70,6 +74,22 @@ def is_silence(chunk: np.ndarray, threshold: float) -> bool:
 
 print("Loading model...")
 model = WhisperModel(MODEL_SIZE, device=DEVICE, compute_type="float16")
+
+# V2: optional MongoDB session for conversation history
+session_id = None
+if ENABLE_DB:
+    try:
+        if ping_sync():
+            session_id = create_session_sync()
+            print("DB: session started (conversations will be saved).")
+            print("Document tools: LLM can list_databases, list_collections, query_documents on localhost MongoDB.")
+        else:
+            print("DB: MongoDB not reachable — running without saving turns.", file=sys.stderr)
+    except Exception as e:
+        print(f"DB: disabled — {e}\n", file=sys.stderr)
+else:
+    print("DB: disabled (ENABLE_DB=False).")
+
 print("Model ready. Speak now — I'll reply (text + speech) after you pause ~2s. (Ctrl+C to stop)")
 
 try:
@@ -119,8 +139,14 @@ try:
                         transcript = " ".join(transcript_lines).strip()
                         if transcript:
                             try:
-                                reply = ask_llm(transcript, system=SYSTEM_PROMPT)
+                                reply = ask_llm(
+                                    transcript,
+                                    system=SYSTEM_PROMPT,
+                                    use_tools=ENABLE_DB,
+                                )
                                 print(f"  → TONY: {reply}\n")
+                                if session_id:
+                                    insert_turn_sync(session_id, transcript, reply, model=OLLAMA_MODEL)
                                 play_tts_reply(reply)
                             except Exception as e:
                                 print(f"  → LLM error: {e}\n", file=sys.stderr)

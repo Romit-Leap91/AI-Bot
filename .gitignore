@@ -11,7 +11,12 @@ __pycache__/
 *.egg-info/
 .eggs/
 
+# Env / secrets (e.g. MONGODB_URI)
+.env
+.env.local
+
 # IDE / OS
+.cursor/
 .idea/
 .vscode/
 *.swp
