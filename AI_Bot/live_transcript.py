@@ -1,5 +1,5 @@
-# live_transcript.py — Faster-Whisper → LLM (Qwen/Ollama) → TTS (Kokoro)
-# LLM replies only after user stops speaking (~2s silence). Reply is printed and spoken.
+# live_transcript.py — Faster-Whisper → LLM (OpenAI) → TTS (Kokoro)
+# LLM replies only after user stops speaking (~3s silence). Reply is printed and spoken.
 
 # Fix CUDA/cuDNN on Windows: add PyTorch's bundled DLLs to search path before any import loads them (cudnnGetLibConfig Error 127)
 import os
@@ -18,11 +18,12 @@ if sys.platform == "win32":
 import numpy as np
 import sounddevice as sd
 from faster_whisper import WhisperModel
-from llm import ask_llm, OLLAMA_MODEL, SYSTEM_PROMPT
+from llm import ask_llm, OPENAI_MODEL, SYSTEM_PROMPT
 from tts import text_to_speech
 from db import create_session_sync, insert_turn_sync, ping_sync
 import queue
 import sys
+import threading
 import time
 
 # --- STT config ---
@@ -32,8 +33,8 @@ BLOCK_SIZE = 8000             # ~0.5s at 16kHz
 SAMPLE_RATE = 16000
 LANGUAGE = "en"               # "hi", "bn", None=auto
 
-# When user stops: treat 2 seconds of silence as end of utterance, then run STT + LLM + TTS
-SILENCE_DURATION_SEC = 2.0
+# When user stops: treat 3 seconds of silence as end of utterance, then run STT + LLM + TTS
+SILENCE_DURATION_SEC = 3.0
 SILENCE_THRESHOLD_RMS = 0.01  # RMS below this = silence (tune if needed: 0.005–0.02)
 MIN_SPEECH_SEC = 0.5          # Ignore if utterance is shorter than this
 
@@ -90,7 +91,7 @@ if ENABLE_DB:
 else:
     print("DB: disabled (ENABLE_DB=False).")
 
-print("Model ready. Speak now — I'll reply (text + speech) after you pause ~2s. (Ctrl+C to stop)")
+print("Model ready. Speak now — I'll reply (text + speech) after you pause ~3s. (Ctrl+C to stop)")
 
 try:
     with sd.InputStream(samplerate=SAMPLE_RATE,
@@ -146,7 +147,12 @@ try:
                                 )
                                 print(f"  → TONY: {reply}\n")
                                 if session_id:
-                                    insert_turn_sync(session_id, transcript, reply, model=OLLAMA_MODEL)
+                                    threading.Thread(
+                                        target=insert_turn_sync,
+                                        args=(session_id, transcript, reply),
+                                        kwargs={"model": OPENAI_MODEL},
+                                        daemon=True,
+                                    ).start()
                                 play_tts_reply(reply)
                             except Exception as e:
                                 print(f"  → LLM error: {e}\n", file=sys.stderr)

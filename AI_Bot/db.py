@@ -15,13 +15,16 @@ DB_NAME = os.environ.get("VOICE_BOT_DB", "voice_bot")
 
 # Single collection: one document per conversation (all turns inside)
 COLL_CONVERSATIONS = "conversations"
-# Legacy: product/knowledge collection (used only by get_knowledge_context / old path).
-COLL_KNOWLEDGE = os.environ.get("VOICE_BOT_KNOWLEDGE_COLL", "knowledge")
-PRODUCT_DB = os.environ.get("VOICE_BOT_PRODUCT_DB", DB_NAME)
-PRODUCT_COLL = os.environ.get("VOICE_BOT_PRODUCT_COLL", COLL_KNOWLEDGE)
 
 # System DBs to skip when listing or searching "all" documents.
 _SKIP_DBS = frozenset({"admin", "local", "config"})
+
+# Question/stop words to strip from search_term so we match on product terms only
+_SEARCH_STOPWORDS = frozenset({
+    "do", "we", "have", "any", "in", "our", "the", "a", "an", "is", "are", "what",
+    "which", "does", "can", "you", "your", "my", "me", "i", "it", "this", "that",
+    "there", "here", "of", "to", "for", "with", "on", "at", "data", "store", "stock",
+})
 
 
 def _get_client() -> AsyncIOMotorClient:
@@ -88,62 +91,18 @@ async def insert_turn(
 
 
 def _format_knowledge_doc(doc: dict) -> str:
-    """Turn one product/knowledge document into a string (skip _id). Prefer name, price, description, etc."""
+    """Turn one document into a readable string (skip _id)."""
     parts = []
-    for key in ("name", "price", "brand", "category", "description", "title", "content", "text", "body"):
-        if key in doc and doc[key] is not None and str(doc[key]).strip():
-            parts.append(f"{key}: {doc[key]}")
-    if not parts:
-        parts = [f"{k}: {v}" for k, v in doc.items() if k != "_id" and v is not None and str(v).strip()]
+    for k, v in doc.items():
+        if k == "_id":
+            continue
+        if v is None:
+            continue
+        s = str(v).strip()
+        if not s:
+            continue
+        parts.append(f"{k}: {s}")
     return "\n".join(parts) if parts else ""
-
-
-async def get_knowledge_context(client: AsyncIOMotorClient | None = None) -> tuple[str, int]:
-    """Fetch all documents from the knowledge collection. Returns (context_string, document_count)."""
-    own_client = client is None
-    if own_client:
-        client = _get_client()
-    try:
-        db = client[DB_NAME]
-        coll = db[COLL_KNOWLEDGE]
-        cursor = coll.find({})
-        chunks = []
-        async for doc in cursor:
-            formatted = _format_knowledge_doc(doc)
-            if formatted:
-                chunks.append(formatted)
-        context = "\n\n---\n\n".join(chunks) if chunks else ""
-        return context, len(chunks)
-    finally:
-        if own_client:
-            client.close()
-
-
-async def query_products(client: AsyncIOMotorClient | None, search_term: str) -> str:
-    """Search the knowledge collection for products matching search_term (case-insensitive).
-    All words in search_term must appear in the document. Returns formatted product info or 'No products found.'"""
-    own_client = client is None
-    if own_client:
-        client = _get_client()
-    try:
-        words = [w.strip() for w in search_term.strip().split() if w.strip()]
-        if not words:
-            return "No products found."
-        db = client[PRODUCT_DB]
-        coll = db[PRODUCT_COLL]
-        cursor = coll.find({})
-        chunks = []
-        async for doc in cursor:
-            formatted = _format_knowledge_doc(doc)
-            if not formatted:
-                continue
-            lower = formatted.lower()
-            if all(w.lower() in lower for w in words):
-                chunks.append(formatted)
-        return "\n\n---\n\n".join(chunks) if chunks else "No products found."
-    finally:
-        if own_client:
-            client.close()
 
 
 async def list_databases(client: AsyncIOMotorClient | None = None) -> list[str]:
@@ -175,12 +134,31 @@ async def list_collections(client: AsyncIOMotorClient | None, database: str) -> 
             client.close()
 
 
+def _word_matches_text(word: str, text_lower: str) -> bool:
+    """True if word (or its plural/singular form) appears in text. Handles laptop/laptops etc."""
+    w = word.lower().strip()
+    if not w:
+        return True
+    if w in text_lower:
+        return True
+    # Plural/singular: "laptop" matches "laptops", "laptops" matches "laptop"
+    if w.endswith("s") and len(w) > 1 and w[:-1] in text_lower:
+        return True
+    if w + "s" in text_lower:
+        return True
+    return False
+
+
 def _doc_matches_search(formatted: str, words: list[str]) -> bool:
-    """True if all words appear in formatted (case-insensitive)."""
-    if not formatted or not words:
+    """True if all (non-stopword) words appear in formatted (case-insensitive). Handles plurals."""
+    if not formatted:
+        return False
+    # Filter stopwords so "Do we have any laptop" -> ["laptop"]
+    filtered = [w for w in words if w and w.lower() not in _SEARCH_STOPWORDS]
+    if not filtered:
         return False
     lower = formatted.lower()
-    return all(w.lower() in lower for w in words)
+    return all(_word_matches_text(w, lower) for w in filtered)
 
 
 async def query_documents(
@@ -266,26 +244,6 @@ def ping_sync() -> bool:
         finally:
             client.close()
     return asyncio.run(_())
-
-
-def get_knowledge_context_sync() -> tuple[str, int]:
-    """Fetch knowledge base from sync code. Returns (context_string, document_count). On error returns ('', 0)."""
-    try:
-        return asyncio.run(get_knowledge_context(None))
-    except Exception as e:
-        import sys
-        print(f"  → Knowledge DB read error: {e}\n", file=sys.stderr)
-        return "", 0
-
-
-def query_products_sync(search_term: str) -> str:
-    """Query product database by name/description from sync code. Returns formatted result or 'No products found.'"""
-    try:
-        return asyncio.run(query_products(None, search_term))
-    except Exception as e:
-        import sys
-        print(f"  → Product query error: {e}\n", file=sys.stderr)
-        return "Database error; could not look up product."
 
 
 def list_databases_sync() -> list[str]:
