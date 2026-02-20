@@ -1,7 +1,7 @@
-# live_transcript.py — Faster-Whisper → LLM (OpenAI) → TTS (Kokoro)
-# LLM replies only after user stops speaking (~3s silence). Reply is printed and spoken.
+# live_transcript.py — STT → LLM (OpenAI) → TTS → output
+# LLM queries MongoDB Atlas when user asks about stored data; otherwise answers from its knowledge.
 
-# Fix CUDA/cuDNN on Windows: add PyTorch's bundled DLLs to search path before any import loads them (cudnnGetLibConfig Error 127)
+# Fix CUDA/cuDNN on Windows
 import os
 import sys
 if sys.platform == "win32":
@@ -18,40 +18,32 @@ if sys.platform == "win32":
 import numpy as np
 import sounddevice as sd
 from faster_whisper import WhisperModel
-from llm import ask_llm, OPENAI_MODEL, SYSTEM_PROMPT
+from llm import ask_llm, SYSTEM_PROMPT
 from tts import text_to_speech
-from db import create_session_sync, insert_turn_sync, ping_sync
+from db import ping_sync
 import queue
-import sys
-import threading
 import time
 
 # --- STT config ---
-MODEL_SIZE = "small"          # tiny / base / small / medium
-DEVICE = "cuda"               # "cuda" if GPU
-BLOCK_SIZE = 8000             # ~0.5s at 16kHz
+MODEL_SIZE = "small"
+DEVICE = "cuda"
+BLOCK_SIZE = 8000
 SAMPLE_RATE = 16000
-LANGUAGE = "en"               # "hi", "bn", None=auto
+LANGUAGE = "en"
 
-# When user stops: treat 3 seconds of silence as end of utterance, then run STT + LLM + TTS
 SILENCE_DURATION_SEC = 3.0
-SILENCE_THRESHOLD_RMS = 0.01  # RMS below this = silence (tune if needed: 0.005–0.02)
-MIN_SPEECH_SEC = 0.5          # Ignore if utterance is shorter than this
+SILENCE_THRESHOLD_RMS = 0.01
+MIN_SPEECH_SEC = 0.5
 
-BLOCKS_PER_SEC = SAMPLE_RATE / BLOCK_SIZE  # ~2 blocks per second
-SILENCE_BLOCKS = int(SILENCE_DURATION_SEC * BLOCKS_PER_SEC)  # ~4 blocks for 2s
+BLOCKS_PER_SEC = SAMPLE_RATE / BLOCK_SIZE
+SILENCE_BLOCKS = int(SILENCE_DURATION_SEC * BLOCKS_PER_SEC)
 
-# --- TTS config (Kokoro): set False to disable speech and keep text-only ---
 ENABLE_TTS = True
-
-# --- V2 MongoDB: set False to run without DB (no session/turn persistence) ---
-ENABLE_DB = True
 
 audio_queue = queue.Queue()
 
 
 def play_tts_reply(reply: str) -> None:
-    """Synthesize reply with Kokoro and play. No-op if TTS disabled or reply empty. Errors are logged, not raised."""
     if not ENABLE_TTS or not (reply and reply.strip()):
         return
     try:
@@ -73,23 +65,15 @@ def is_silence(chunk: np.ndarray, threshold: float) -> bool:
     rms = np.sqrt(np.mean(chunk.astype(np.float64) ** 2))
     return rms < threshold
 
+
 print("Loading model...")
 model = WhisperModel(MODEL_SIZE, device=DEVICE, compute_type="float16")
 
-# V2: optional MongoDB session for conversation history
-session_id = None
-if ENABLE_DB:
-    try:
-        if ping_sync():
-            session_id = create_session_sync()
-            print("DB: session started (conversations will be saved).")
-            print("Document tools: LLM can list_databases, list_collections, query_documents on localhost MongoDB.")
-        else:
-            print("DB: MongoDB not reachable — running without saving turns.", file=sys.stderr)
-    except Exception as e:
-        print(f"DB: disabled — {e}\n", file=sys.stderr)
+# MongoDB Atlas: LLM can query when user asks about stored data
+if ping_sync():
+    print("DB: MongoDB Atlas connected. LLM can query your data (e.g. CrewgleAI_Store, Sports Items).")
 else:
-    print("DB: disabled (ENABLE_DB=False).")
+    print("DB: MongoDB not reachable — LLM will answer from its knowledge only.", file=sys.stderr)
 
 print("Model ready. Speak now — I'll reply (text + speech) after you pause ~3s. (Ctrl+C to stop)")
 
@@ -99,29 +83,27 @@ try:
                         dtype='float32',
                         blocksize=BLOCK_SIZE,
                         callback=audio_callback):
-        
+
         buffer = np.array([], dtype=np.float32)
         silence_block_count = 0
         had_speech = False
-        
+
         while True:
             try:
                 chunk = audio_queue.get(timeout=0.1)
                 chunk_flat = chunk.flatten()
                 buffer = np.concatenate((buffer, chunk_flat))
-                
+
                 if is_silence(chunk_flat, SILENCE_THRESHOLD_RMS):
                     silence_block_count += 1
                 else:
                     silence_block_count = 0
                     had_speech = True
-                
-                # User stopped: 2s of silence after some speech → transcribe + LLM
+
                 if silence_block_count >= SILENCE_BLOCKS and had_speech:
-                    # Utterance = everything except the trailing silence
                     silence_samples = int(SAMPLE_RATE * SILENCE_DURATION_SEC)
                     utterance = buffer[:-silence_samples] if len(buffer) > silence_samples else buffer
-                    
+
                     if len(utterance) >= SAMPLE_RATE * MIN_SPEECH_SEC:
                         segments, info = model.transcribe(
                             utterance,
@@ -140,28 +122,16 @@ try:
                         transcript = " ".join(transcript_lines).strip()
                         if transcript:
                             try:
-                                reply = ask_llm(
-                                    transcript,
-                                    system=SYSTEM_PROMPT,
-                                    use_tools=ENABLE_DB,
-                                )
+                                reply = ask_llm(transcript, system=SYSTEM_PROMPT, use_tools=True)
                                 print(f"  → TONY: {reply}\n")
-                                if session_id:
-                                    threading.Thread(
-                                        target=insert_turn_sync,
-                                        args=(session_id, transcript, reply),
-                                        kwargs={"model": OPENAI_MODEL},
-                                        daemon=True,
-                                    ).start()
                                 play_tts_reply(reply)
                             except Exception as e:
                                 print(f"  → LLM error: {e}\n", file=sys.stderr)
-                    
-                    # Reset: keep last 0.5s to avoid clipping next utterance
+
                     buffer = buffer[-BLOCK_SIZE:]
                     silence_block_count = 0
                     had_speech = False
-                    
+
             except queue.Empty:
                 time.sleep(0.05)
                 continue

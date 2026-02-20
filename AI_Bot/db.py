@@ -1,25 +1,24 @@
-# V2 — MongoDB (Motor async). One conversation = one document with a "turns" array.
-# Use create_session() / insert_turn() from async code, or *_sync() from sync code.
+# MongoDB (Motor async). Query-only: list_databases, list_collections, query_documents.
+# LLM uses these to read from Atlas (e.g. CrewgleAI_Store, Sports Items). No conversation storage.
+# Config from AI_Bot/.env: MONGODB_URI.
 
 import os
 import asyncio
-from datetime import datetime, timezone
-from typing import Any
+from pathlib import Path
 
-from bson import ObjectId
 from motor.motor_asyncio import AsyncIOMotorClient
 
-# Config: env MONGODB_URI (default local), VOICE_BOT_DB (default voice_bot)
+# Load .env from AI_Bot/
+try:
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).resolve().parent / ".env")
+except Exception:
+    pass
+
 MONGODB_URI = os.environ.get("MONGODB_URI", "mongodb://localhost:27017")
-DB_NAME = os.environ.get("VOICE_BOT_DB", "voice_bot")
 
-# Single collection: one document per conversation (all turns inside)
-COLL_CONVERSATIONS = "conversations"
-
-# System DBs to skip when listing or searching "all" documents.
 _SKIP_DBS = frozenset({"admin", "local", "config"})
 
-# Question/stop words to strip from search_term so we match on product terms only
 _SEARCH_STOPWORDS = frozenset({
     "do", "we", "have", "any", "in", "our", "the", "a", "an", "is", "are", "what",
     "which", "does", "can", "you", "your", "my", "me", "i", "it", "this", "that",
@@ -28,7 +27,6 @@ _SEARCH_STOPWORDS = frozenset({
 
 
 def _get_client() -> AsyncIOMotorClient:
-    """Return a new Motor client (use in async context or per sync call)."""
     return AsyncIOMotorClient(MONGODB_URI)
 
 
@@ -37,57 +35,10 @@ async def ping(client: AsyncIOMotorClient) -> bool:
     try:
         await client.admin.command("ping")
         return True
-    except Exception:
+    except Exception as e:
+        import sys
+        print(f"MongoDB connection error: {e}", file=sys.stderr)
         return False
-
-
-async def create_session(client: AsyncIOMotorClient | None = None) -> str:
-    """Create one conversation document (turns=[]) and return its _id as string."""
-    own_client = client is None
-    if own_client:
-        client = _get_client()
-    try:
-        db = client[DB_NAME]
-        coll = db[COLL_CONVERSATIONS]
-        now = datetime.now(timezone.utc)
-        doc = {"created_at": now, "updated_at": now, "turns": [], "metadata": {}}
-        result = await coll.insert_one(doc)
-        return str(result.inserted_id)
-    finally:
-        if own_client:
-            client.close()
-
-
-async def insert_turn(
-    session_id: str,
-    user_text: str,
-    assistant_text: str,
-    *,
-    client: AsyncIOMotorClient | None = None,
-    model: str | None = None,
-) -> None:
-    """Append one turn to the conversation document ( $push to turns )."""
-    own_client = client is None
-    if own_client:
-        client = _get_client()
-    try:
-        db = client[DB_NAME]
-        coll = db[COLL_CONVERSATIONS]
-        now = datetime.now(timezone.utc)
-        turn = {
-            "user_text": user_text,
-            "assistant_text": assistant_text,
-            "created_at": now,
-        }
-        if model:
-            turn["model"] = model
-        await coll.update_one(
-            {"_id": ObjectId(session_id)},
-            {"$push": {"turns": turn}, "$set": {"updated_at": now}},
-        )
-    finally:
-        if own_client:
-            client.close()
 
 
 def _format_knowledge_doc(doc: dict) -> str:
@@ -105,8 +56,30 @@ def _format_knowledge_doc(doc: dict) -> str:
     return "\n".join(parts) if parts else ""
 
 
+def _word_matches_text(word: str, text_lower: str) -> bool:
+    w = word.lower().strip()
+    if not w:
+        return True
+    if w in text_lower:
+        return True
+    if w.endswith("s") and len(w) > 1 and w[:-1] in text_lower:
+        return True
+    if w + "s" in text_lower:
+        return True
+    return False
+
+
+def _doc_matches_search(formatted: str, words: list[str]) -> bool:
+    if not formatted:
+        return False
+    filtered = [w for w in words if w and w.lower() not in _SEARCH_STOPWORDS]
+    if not filtered:
+        return False
+    lower = formatted.lower()
+    return all(_word_matches_text(w, lower) for w in filtered)
+
+
 async def list_databases(client: AsyncIOMotorClient | None = None) -> list[str]:
-    """List all database names on the MongoDB server (excluding admin, local, config)."""
     own_client = client is None
     if own_client:
         client = _get_client()
@@ -119,7 +92,6 @@ async def list_databases(client: AsyncIOMotorClient | None = None) -> list[str]:
 
 
 async def list_collections(client: AsyncIOMotorClient | None, database: str) -> list[str]:
-    """List all collection names in the given database."""
     own_client = client is None
     if own_client:
         client = _get_client()
@@ -134,42 +106,12 @@ async def list_collections(client: AsyncIOMotorClient | None, database: str) -> 
             client.close()
 
 
-def _word_matches_text(word: str, text_lower: str) -> bool:
-    """True if word (or its plural/singular form) appears in text. Handles laptop/laptops etc."""
-    w = word.lower().strip()
-    if not w:
-        return True
-    if w in text_lower:
-        return True
-    # Plural/singular: "laptop" matches "laptops", "laptops" matches "laptop"
-    if w.endswith("s") and len(w) > 1 and w[:-1] in text_lower:
-        return True
-    if w + "s" in text_lower:
-        return True
-    return False
-
-
-def _doc_matches_search(formatted: str, words: list[str]) -> bool:
-    """True if all (non-stopword) words appear in formatted (case-insensitive). Handles plurals."""
-    if not formatted:
-        return False
-    # Filter stopwords so "Do we have any laptop" -> ["laptop"]
-    filtered = [w for w in words if w and w.lower() not in _SEARCH_STOPWORDS]
-    if not filtered:
-        return False
-    lower = formatted.lower()
-    return all(_word_matches_text(w, lower) for w in filtered)
-
-
 async def query_documents(
     client: AsyncIOMotorClient | None,
     database: str,
     collection: str,
     search_term: str,
 ) -> str:
-    """Query documents in database.collection. If database or collection is empty, search ALL databases and
-    collections on the server (excluding system DBs) and return results labeled by source.
-    Documents are matched when all words in search_term appear in the document text (case-insensitive)."""
     own_client = client is None
     if own_client:
         client = _get_client()
@@ -214,29 +156,9 @@ async def query_documents(
             client.close()
 
 
-# --- Sync wrappers for use from live_transcript (sync main loop) ---
-
-def create_session_sync() -> str:
-    """Create a session from sync code. Returns session_id string."""
-    return asyncio.run(create_session(None))
-
-
-def insert_turn_sync(
-    session_id: str,
-    user_text: str,
-    assistant_text: str,
-    model: str | None = None,
-) -> None:
-    """Insert one turn from sync code. Logs and swallows DB errors so pipeline keeps running."""
-    try:
-        asyncio.run(insert_turn(session_id, user_text, assistant_text, model=model))
-    except Exception as e:
-        import sys
-        print(f"  → DB write error (turn not saved): {e}\n", file=sys.stderr)
-
+# --- Sync wrappers for LLM tools ---
 
 def ping_sync() -> bool:
-    """Check MongoDB from sync code."""
     async def _():
         client = _get_client()
         try:
@@ -247,7 +169,6 @@ def ping_sync() -> bool:
 
 
 def list_databases_sync() -> list[str]:
-    """List all database names (excluding system DBs). On error returns []."""
     try:
         return asyncio.run(list_databases(None))
     except Exception as e:
@@ -257,7 +178,6 @@ def list_databases_sync() -> list[str]:
 
 
 def list_collections_sync(database: str) -> list[str]:
-    """List all collection names in the given database. On error returns []."""
     try:
         return asyncio.run(list_collections(None, database))
     except Exception as e:
@@ -267,7 +187,6 @@ def list_collections_sync(database: str) -> list[str]:
 
 
 def query_documents_sync(database: str, collection: str, search_term: str) -> str:
-    """Query documents in database.collection, or search all DBs/collections if database or collection is empty."""
     try:
         return asyncio.run(query_documents(None, database, collection, search_term))
     except Exception as e:

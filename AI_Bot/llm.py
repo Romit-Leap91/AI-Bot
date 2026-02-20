@@ -12,13 +12,12 @@ from openai import OpenAI
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
 SYSTEM_PROMPT = "You are TONY, a helpful voice assistant. Reply in one or two short sentences."
 
-# Document-oriented: LLM decides which database/collection to query based on the user's question.
+# LLM can query MongoDB Atlas when user asks about stored data; otherwise answer from training.
 SYSTEM_PROMPT_WITH_TOOLS = (
-    "You are TONY, a helpful voice assistant. You have access to MongoDB on localhost with tools that can read the user's data. "
-    "Use these tools ONLY for questions clearly about the user's stored products or inventory (for example monitors, mice, keyboards, laptops, "
-    "or specific product models and their prices/stock/ warrenty/ origin country(origin)). For those questions, prefer calling the tools and trust the database over your memory. "
-    "For all other topics such as people, places, general knowledge, or chit‑chat, answer from your own training "
-    "data and DO NOT call the tools. If you do call the tools and they return matching documents, base your product answer strictly on that data. "
+    "You are TONY, a helpful voice assistant. You have access to MongoDB Atlas with tools to read the user's data "
+    "(e.g. CrewgleAI_Store, Sports Items, products, inventory). Use these tools ONLY for questions about stored data: "
+    "products, sports items, prices, stock, warranty, origin, or similar. For those questions, call the tools and base your answer on the data returned. "
+    "For all other topics (people, places, general knowledge, chit-chat), answer from your training and DO NOT call the tools. "
     "Reply in one or two short sentences."
 )
 
@@ -28,7 +27,7 @@ OPENAI_TOOLS = [
         "type": "function",
         "function": {
             "name": "list_databases",
-            "description": "List all database names on the MongoDB server (localhost). Use this to see what data is available.",
+            "description": "List all database names on the MongoDB server (cloud or local). Use this to see what data is available.",
         },
     },
     {
@@ -41,7 +40,7 @@ OPENAI_TOOLS = [
                 "properties": {
                     "database": {
                         "type": "string",
-                        "description": "The database name (e.g. 'Crewgle_Store', 'voice_bot').",
+                        "description": "The database name (e.g. 'CrewgleAI_Store').",
                     },
                 },
                 "required": ["database"],
@@ -58,11 +57,11 @@ OPENAI_TOOLS = [
                 "properties": {
                     "database": {
                         "type": "string",
-                        "description": "Database name (e.g. 'Crewgle_Store'), or '' to search all databases.",
+                        "description": "Database name (e.g. 'CrewgleAI_Store'), or '' to search all databases.",
                     },
                     "collection": {
                         "type": "string",
-                        "description": "Collection name (e.g. 'Product'), or '' to search all collections.",
+                        "description": "Collection name (e.g. 'Sports Items', 'Product'), or '' to search all collections.",
                     },
                     "search_term": {
                         "type": "string",
@@ -77,7 +76,7 @@ OPENAI_TOOLS = [
 
 
 def list_databases() -> list[str]:
-    """List all database names on the MongoDB server (localhost). Use this to see what data is available."""
+    """List all database names on the MongoDB Atlas server. Use this to see what data is available."""
     from db import list_databases_sync
     return list_databases_sync()
 
@@ -113,16 +112,19 @@ def ask_llm(
     a product/inventory question; otherwise the model answers from its training data.
     """
 
-    def looks_like_product_question(text: str) -> bool:
+    def looks_like_data_question(text: str) -> bool:
         t = (text or "").lower()
         keywords = (
             "price", "cost", "how much", "rs", "₹", "$", "dollar", "origin", "warrenty", "warranties",
-            "monitor", "mouse", "keyboard", "laptop", "headphone", "earphone",
-            "ssd", "hdd", "gpu", "graphics card",
+            "monitor", "mouse", "keyboard", "laptop", "headphone", "earphone", "ssd", "hdd", "gpu", "graphics card",
+            "jeans", "pants", "shirt", "shoes", "shoe", "heels", "sneakers",
+            "sport", "sports", "ball", "cricket", "football", "item", "items", "colour", "brand", "size",
+            "do we have", "in stock", "inventory", "product", "products", "database", "data", "store",
+            "crewgleai_store", "crewgle", "sports items", "fashion items",
         )
         return any(k in t for k in keywords)
 
-    use_db_tools = bool(use_tools and looks_like_product_question(prompt))
+    use_db_tools = bool(use_tools and looks_like_data_question(prompt))
 
     client = _get_client()
     messages = [{"role": "user", "content": prompt}]
