@@ -1,9 +1,14 @@
-# live_transcript.py — STT → LLM (OpenAI) → TTS → output
-# LLM queries MongoDB Atlas when user asks about stored data; otherwise answers from its knowledge.
+# bot.py — Voice bot: STT → LLM (OpenAI) → TTS. Run this to activate the bot.
 
-# Fix CUDA/cuDNN on Windows
 import os
 import sys
+import queue
+import time
+
+import numpy as np
+import sounddevice as sd
+
+# Fix CUDA/cuDNN on Windows
 if sys.platform == "win32":
     try:
         import importlib.util
@@ -15,30 +20,21 @@ if sys.platform == "win32":
     except Exception:
         pass
 
-import numpy as np
-import sounddevice as sd
-from faster_whisper import WhisperModel
+from stt import load_model, transcribe, SAMPLE_RATE
 from llm import ask_llm, SYSTEM_PROMPT
 from tts import text_to_speech
 from db import ping_sync
-import queue
-import time
 
-# --- STT config ---
-MODEL_SIZE = "small"
-DEVICE = "cuda"
+# --- Pipeline config ---
 BLOCK_SIZE = 8000
-SAMPLE_RATE = 16000
-LANGUAGE = "en"
-
 SILENCE_DURATION_SEC = 3.0
 SILENCE_THRESHOLD_RMS = 0.01
 MIN_SPEECH_SEC = 0.5
+LANGUAGE = "en"
+ENABLE_TTS = True
 
 BLOCKS_PER_SEC = SAMPLE_RATE / BLOCK_SIZE
 SILENCE_BLOCKS = int(SILENCE_DURATION_SEC * BLOCKS_PER_SEC)
-
-ENABLE_TTS = True
 
 audio_queue = queue.Queue()
 
@@ -66,24 +62,24 @@ def is_silence(chunk: np.ndarray, threshold: float) -> bool:
     return rms < threshold
 
 
-print("Loading model...")
-model = WhisperModel(MODEL_SIZE, device=DEVICE, compute_type="float16")
+def run():
+    print("Loading model...")
+    load_model()
 
-# MongoDB Atlas: LLM can query when user asks about stored data
-if ping_sync():
-    print("DB: MongoDB Atlas connected. LLM can query your data (e.g. CrewgleAI_Store, Sports Items).")
-else:
-    print("DB: MongoDB not reachable — LLM will answer from its knowledge only.", file=sys.stderr)
+    if ping_sync():
+        print("DB: MongoDB Atlas connected. LLM can query your data (e.g. CrewgleAI_Store, Sports Items).")
+    else:
+        print("DB: MongoDB not reachable — LLM will answer from its knowledge only.", file=sys.stderr)
 
-print("Model ready. Speak now — I'll reply (text + speech) after you pause ~3s. (Ctrl+C to stop)")
+    print("Model ready. Speak now — I'll reply (text + speech) after you pause ~3s. (Ctrl+C to stop)")
 
-try:
-    with sd.InputStream(samplerate=SAMPLE_RATE,
-                        channels=1,
-                        dtype='float32',
-                        blocksize=BLOCK_SIZE,
-                        callback=audio_callback):
-
+    with sd.InputStream(
+        samplerate=SAMPLE_RATE,
+        channels=1,
+        dtype="float32",
+        blocksize=BLOCK_SIZE,
+        callback=audio_callback,
+    ):
         buffer = np.array([], dtype=np.float32)
         silence_block_count = 0
         had_speech = False
@@ -105,22 +101,10 @@ try:
                     utterance = buffer[:-silence_samples] if len(buffer) > silence_samples else buffer
 
                     if len(utterance) >= SAMPLE_RATE * MIN_SPEECH_SEC:
-                        segments, info = model.transcribe(
-                            utterance,
-                            beam_size=5,
-                            language=LANGUAGE,
-                            vad_filter=True,
-                            vad_parameters=dict(min_silence_duration_ms=500),
-                        )
-                        print(f"[lang: {info.language}]")
-                        transcript_lines = []
-                        for segment in segments:
-                            text = segment.text.strip()
-                            if text:
-                                print(f"[{segment.start:.1f}s → {segment.end:.1f}s] {text}")
-                                transcript_lines.append(text)
-                        transcript = " ".join(transcript_lines).strip()
+                        transcript, lang = transcribe(utterance, language=LANGUAGE)
+                        print(f"[lang: {lang}]")
                         if transcript:
+                            print(transcript)
                             try:
                                 reply = ask_llm(transcript, system=SYSTEM_PROMPT, use_tools=True)
                                 print(f"  → TONY: {reply}\n")
@@ -136,5 +120,9 @@ try:
                 time.sleep(0.05)
                 continue
 
-except KeyboardInterrupt:
-    print("\nStopped.")
+
+if __name__ == "__main__":
+    try:
+        run()
+    except KeyboardInterrupt:
+        print("\nStopped.")
